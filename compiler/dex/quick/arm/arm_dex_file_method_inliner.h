@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012 The Android Open Source Project
+ * Copyright (C) 2013 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,27 +14,24 @@
  * limitations under the License.
  */
 
-#ifndef ART_RUNTIME_DISASSEMBLER_MIPS_H_
-#define ART_RUNTIME_DISASSEMBLER_MIPS_H_
+#ifndef ART_COMPILER_DEX_QUICK_ARM_ARM_DEX_FILE_METHOD_INLINER_H_
+#define ART_COMPILER_DEX_QUICK_ARM_ARM_DEX_FILE_METHOD_INLINER_H_
 
-#include <vector>
-
-#include "disassembler.h"
+#include "dex/quick/dex_file_method_inliner.h"
 
 namespace art {
-namespace mips {
 
-class DisassemblerMips : public Disassembler {
- public:
-  DisassemblerMips();
-  virtual size_t Dump(std::ostream& os, const uint8_t* begin);
-  virtual void Dump(std::ostream& os, const uint8_t* begin, const uint8_t* end);
+class ArmDexFileMethodInliner : public DexFileMethodInliner {
+  public:
+    ArmDexFileMethodInliner();
+    ~ArmDexFileMethodInliner();
 
- private:
-  DISALLOW_COPY_AND_ASSIGN(DisassemblerMips);
+    void FindIntrinsics(const DexFile* dex_file);
+
+  private:
+    static const IntrinsicDef kIntrinsicMethods[];
 };
 
-}  // namespace mips
 }  // namespace art
 
-#endif  // ART_RUNTIME_DISASSEMBLER_MIPS_H_
+#endif  // ART_COMPILER_DEX_QUICK_ARM_ARM_DEX_FILE_METHOD_INLINER_H_

@@ -17,6 +17,7 @@
 #ifndef ART_RUNTIME_MIRROR_CLASS_H_
 #define ART_RUNTIME_MIRROR_CLASS_H_
 
+#include "gc/heap.h"
 #include "modifiers.h"
 #include "object.h"
 #include "primitive.h"
@@ -59,6 +60,7 @@ namespace art {
 
 struct ClassClassOffsets;
 struct ClassOffsets;
+class Signature;
 class StringPiece;
 
 namespace mirror {
@@ -121,6 +123,7 @@ class MANAGED Class : public StaticStorageBase {
     kStatusVerified = 7,  // Logically part of linking; done pre-init.
     kStatusInitializing = 8,  // Class init in progress.
     kStatusInitialized = 9,  // Ready to go.
+    kStatusMax = 10,
   };
 
   Status GetStatus() const {
@@ -246,7 +249,7 @@ class MANAGED Class : public StaticStorageBase {
     } else {
       Class* component = GetComponentType();
       if (component->IsPrimitive()) {
-        return false;
+        return true;
       } else {
         return component->CannotBeAssignedFromOtherTypes();
       }
@@ -345,14 +348,18 @@ class MANAGED Class : public StaticStorageBase {
 
   bool IsArtMethodClass() const;
 
+  static MemberOffset ComponentTypeOffset() {
+    return OFFSET_OF_OBJECT_MEMBER(Class, component_type_);
+  }
+
   Class* GetComponentType() const {
-    return GetFieldObject<Class*>(OFFSET_OF_OBJECT_MEMBER(Class, component_type_), false);
+    return GetFieldObject<Class*>(ComponentTypeOffset(), false);
   }
 
   void SetComponentType(Class* new_component_type) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     DCHECK(GetComponentType() == NULL);
     DCHECK(new_component_type != NULL);
-    SetFieldObject(OFFSET_OF_OBJECT_MEMBER(Class, component_type_), new_component_type, false);
+    SetFieldObject(ComponentTypeOffset(), new_component_type, false);
   }
 
   size_t GetComponentSize() const {
@@ -371,7 +378,14 @@ class MANAGED Class : public StaticStorageBase {
   }
 
   // Creates a raw object instance but does not invoke the default constructor.
-  Object* AllocObject(Thread* self) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  template <bool kIsInstrumented>
+  ALWAYS_INLINE Object* Alloc(Thread* self, gc::AllocatorType allocator_type)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  Object* AllocObject(Thread* self)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  Object* AllocNonMovableObject(Thread* self)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   bool IsVariableSize() const {
     // Classes and arrays vary in size, and so the object_size_ field cannot
@@ -544,6 +558,15 @@ class MANAGED Class : public StaticStorageBase {
     return OFFSET_OF_OBJECT_MEMBER(Class, vtable_);
   }
 
+  ObjectArray<ArtMethod>* GetImTable() const;
+
+  void SetImTable(ObjectArray<ArtMethod>* new_imtable)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  static MemberOffset ImTableOffset() {
+    return OFFSET_OF_OBJECT_MEMBER(Class, imtable_);
+  }
+
   // Given a method implemented by this class but potentially from a super class, return the
   // specific implementation method for this class.
   ArtMethod* FindVirtualMethodForVirtual(ArtMethod* method) const
@@ -560,28 +583,19 @@ class MANAGED Class : public StaticStorageBase {
   ArtMethod* FindVirtualMethodForInterface(ArtMethod* method) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) ALWAYS_INLINE;
 
-  ArtMethod* FindInterfaceMethod(const StringPiece& name, const StringPiece& descriptor) const
+  ArtMethod* FindVirtualMethodForVirtualOrInterface(ArtMethod* method) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  ArtMethod* FindInterfaceMethod(const StringPiece& name, const Signature& signature) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   ArtMethod* FindInterfaceMethod(const DexCache* dex_cache, uint32_t dex_method_idx) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  ArtMethod* FindVirtualMethodForVirtualOrInterface(ArtMethod* method) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  ArtMethod* FindDeclaredVirtualMethod(const StringPiece& name, const StringPiece& signature) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  ArtMethod* FindDeclaredVirtualMethod(const DexCache* dex_cache, uint32_t dex_method_idx) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  ArtMethod* FindVirtualMethod(const StringPiece& name, const StringPiece& descriptor) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  ArtMethod* FindVirtualMethod(const DexCache* dex_cache, uint32_t dex_method_idx) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
   ArtMethod* FindDeclaredDirectMethod(const StringPiece& name, const StringPiece& signature) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  ArtMethod* FindDeclaredDirectMethod(const StringPiece& name, const Signature& signature) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   ArtMethod* FindDeclaredDirectMethod(const DexCache* dex_cache, uint32_t dex_method_idx) const
@@ -590,8 +604,31 @@ class MANAGED Class : public StaticStorageBase {
   ArtMethod* FindDirectMethod(const StringPiece& name, const StringPiece& signature) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+  ArtMethod* FindDirectMethod(const StringPiece& name, const Signature& signature) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
   ArtMethod* FindDirectMethod(const DexCache* dex_cache, uint32_t dex_method_idx) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  ArtMethod* FindDeclaredVirtualMethod(const StringPiece& name, const StringPiece& signature) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  ArtMethod* FindDeclaredVirtualMethod(const StringPiece& name, const Signature& signature) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  ArtMethod* FindDeclaredVirtualMethod(const DexCache* dex_cache, uint32_t dex_method_idx) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  ArtMethod* FindVirtualMethod(const StringPiece& name, const StringPiece& signature) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  ArtMethod* FindVirtualMethod(const StringPiece& name, const Signature& signature) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  ArtMethod* FindVirtualMethod(const DexCache* dex_cache, uint32_t dex_method_idx) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  ArtMethod* FindClassInitializer() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   int32_t GetIfTableCount() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
@@ -764,6 +801,8 @@ class MANAGED Class : public StaticStorageBase {
   bool IsAssignableFromArray(const Class* klass) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
+  void CheckObjectAlloc() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
   // defining class loader, or NULL for the "bootstrap" system loader
   ClassLoader* class_loader_;
 
@@ -802,6 +841,9 @@ class MANAGED Class : public StaticStorageBase {
   // For every interface a concrete class implements, we create an array of the concrete vtable_
   // methods for the methods in the interface.
   IfTable* iftable_;
+
+  // Interface method table (imt), for quick "invoke-interface".
+  ObjectArray<ArtMethod>* imtable_;
 
   // descriptor for the class such as "java.lang.Class" or "[C". Lazily initialized by ComputeName
   String* name_;
@@ -885,6 +927,7 @@ std::ostream& operator<<(std::ostream& os, const Class::Status& rhs);
 
 class MANAGED ClassClass : public Class {
  private:
+  int32_t pad_;
   int64_t serialVersionUID_;
   friend struct art::ClassClassOffsets;  // for verifying offset information
   DISALLOW_IMPLICIT_CONSTRUCTORS(ClassClass);

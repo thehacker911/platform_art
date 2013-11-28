@@ -16,14 +16,21 @@
 
 #include "asm_support_x86.S"
 
+#include "arch/quick_alloc_entrypoints.S"
+
+// For x86, the CFA is esp+4, the address above the pushed return address on the stack.
+
     /*
      * Macro that sets up the callee save frame to conform with
      * Runtime::CreateCalleeSaveMethod(kSaveAll)
      */
 MACRO0(SETUP_SAVE_ALL_CALLEE_SAVE_FRAME)
     PUSH edi  // Save callee saves (ebx is saved/restored by the upcall)
+    .cfi_rel_offset edi, -8
     PUSH esi
+    .cfi_rel_offset esi, -12
     PUSH ebp
+    .cfi_rel_offset ebp, -16
     subl  MACRO_LITERAL(16), %esp  // Grow stack by 4 words, bottom word will hold Method*
     .cfi_adjust_cfa_offset 16
 END_MACRO
@@ -34,14 +41,23 @@ END_MACRO
      */
 MACRO0(SETUP_REF_ONLY_CALLEE_SAVE_FRAME)
     PUSH edi  // Save callee saves (ebx is saved/restored by the upcall)
+     .cfi_rel_offset edi, -8
     PUSH esi
+    .cfi_rel_offset esi, -12
     PUSH ebp
+     .cfi_rel_offset ebp, -16
     subl  MACRO_LITERAL(16), %esp  // Grow stack by 4 words, bottom word will hold Method*
     .cfi_adjust_cfa_offset 16
 END_MACRO
 
 MACRO0(RESTORE_REF_ONLY_CALLEE_SAVE_FRAME)
-    addl MACRO_LITERAL(28), %esp  // Unwind stack up to return address
+    addl MACRO_LITERAL(16), %esp  // Unwind stack up to return address
+    POP ebp  // Restore callee saves (ebx is saved/restored by the upcall)
+    .cfi_restore ebp
+    POP esi
+    .cfi_restore esi
+    POP edi
+    .cfi_restore edi
     .cfi_adjust_cfa_offset -28
 END_MACRO
 
@@ -51,23 +67,36 @@ END_MACRO
      */
 MACRO0(SETUP_REF_AND_ARGS_CALLEE_SAVE_FRAME)
     PUSH edi  // Save callee saves
+    .cfi_rel_offset edi, -8
     PUSH esi
+    .cfi_rel_offset esi, -12
     PUSH ebp
+    .cfi_rel_offset ebp, -16
     PUSH ebx  // Save args
+    .cfi_rel_offset ebx, -20
     PUSH edx
+    .cfi_rel_offset edx, -24
     PUSH ecx
+    .cfi_rel_offset ecx, -28
     PUSH eax   // Align stack, eax will be clobbered by Method*
+    .cfi_rel_offset eax, -28
 END_MACRO
 
 MACRO0(RESTORE_REF_AND_ARGS_CALLEE_SAVE_FRAME)
     addl MACRO_LITERAL(4), %esp  // Remove padding
     .cfi_adjust_cfa_offset -4
     POP ecx  // Restore args except eax
+    .cfi_restore ecx
     POP edx
+    .cfi_restore edx
     POP ebx
+    .cfi_restore ebx
     POP ebp  // Restore callee saves
+    .cfi_restore ebp
     POP esi
+    .cfi_restore esi
     POP edi
+    .cfi_restore edi
 END_MACRO
 
     /*
@@ -185,12 +214,19 @@ MACRO2(INVOKE_TRAMPOLINE, c_name, cxx_name)
     // Set up the callee save frame to conform with Runtime::CreateCalleeSaveMethod(kRefsAndArgs)
     // return address
     PUSH edi
+    .cfi_rel_offset edi, -8
     PUSH esi
+    .cfi_rel_offset esi, -12
     PUSH ebp
-    PUSH ebx
+    .cfi_rel_offset ebp, -16
+    PUSH ebx  // Save args
+    .cfi_rel_offset ebx, -20
     PUSH edx
+    .cfi_rel_offset edx, -24
     PUSH ecx
-    PUSH eax   // <-- callee save Method* to go here
+    .cfi_rel_offset ecx, -28
+    PUSH eax    // <-- callee save Method* to go here
+    .cfi_rel_offset eax, -32
     movl %esp, %edx  // remember SP
     // Outgoing argument set up
     subl MACRO_LITERAL(12), %esp  // alignment padding
@@ -206,11 +242,16 @@ MACRO2(INVOKE_TRAMPOLINE, c_name, cxx_name)
     movl %edx, %edi               // save code pointer in EDI
     addl MACRO_LITERAL(36), %esp  // Pop arguments skip eax
     .cfi_adjust_cfa_offset -36
-    POP ecx                       // Restore args
+    POP ecx  // Restore args except eax
+    .cfi_restore ecx
     POP edx
+    .cfi_restore edx
     POP ebx
-    POP ebp  // Restore callee saves.
+    .cfi_restore ebx
+    POP ebp  // Restore callee saves
+    .cfi_restore ebp
     POP esi
+    .cfi_restore esi
     // Swap EDI callee save with code pointer.
     xchgl %edi, (%esp)
     testl %eax, %eax              // Branch forward if exception pending.
@@ -245,7 +286,9 @@ INVOKE_TRAMPOLINE art_quick_invoke_virtual_trampoline_with_access_check, artInvo
      */
 DEFINE_FUNCTION art_quick_invoke_stub
     PUSH ebp                      // save ebp
+    .cfi_rel_offset ebp, -8
     PUSH ebx                      // save ebx
+    .cfi_rel_offset ebx, -12
     mov %esp, %ebp                // copy value of stack pointer into base pointer
     .cfi_def_cfa_register ebp
     mov 20(%ebp), %ebx            // get arg array size
@@ -266,8 +309,11 @@ DEFINE_FUNCTION art_quick_invoke_stub
     mov 12(%esp), %ebx            // copy arg3 into ebx
     call *METHOD_CODE_OFFSET(%eax) // call the method
     mov %ebp, %esp                // restore stack pointer
+    .cfi_def_cfa_register esp
     POP ebx                       // pop ebx
+    .cfi_restore ebx
     POP ebp                       // pop ebp
+    .cfi_restore ebp
     mov 20(%esp), %ecx            // get result pointer
     cmpl LITERAL(68), 24(%esp)    // test if result type char == 'D'
     je return_double_quick
@@ -357,7 +403,7 @@ MACRO3(THREE_ARG_DOWNCALL, c_name, cxx_name, return_macro)
     END_FUNCTION VAR(c_name, 0)
 END_MACRO
 
-MACRO0(RETURN_IF_EAX_NOT_ZERO)
+MACRO0(RETURN_IF_RESULT_IS_NON_ZERO)
     testl %eax, %eax               // eax == 0 ?
     jz  1f                         // if eax == 0 goto 1
     ret                            // return
@@ -382,32 +428,206 @@ MACRO0(RETURN_OR_DELIVER_PENDING_EXCEPTION)
     DELIVER_PENDING_EXCEPTION
 END_MACRO
 
-TWO_ARG_DOWNCALL art_quick_alloc_object, artAllocObjectFromCode, RETURN_IF_EAX_NOT_ZERO
-TWO_ARG_DOWNCALL art_quick_alloc_object_with_access_check, artAllocObjectFromCodeWithAccessCheck, RETURN_IF_EAX_NOT_ZERO
-THREE_ARG_DOWNCALL art_quick_alloc_array, artAllocArrayFromCode, RETURN_IF_EAX_NOT_ZERO
-THREE_ARG_DOWNCALL art_quick_alloc_array_with_access_check, artAllocArrayFromCodeWithAccessCheck, RETURN_IF_EAX_NOT_ZERO
-THREE_ARG_DOWNCALL art_quick_check_and_alloc_array, artCheckAndAllocArrayFromCode, RETURN_IF_EAX_NOT_ZERO
-THREE_ARG_DOWNCALL art_quick_check_and_alloc_array_with_access_check, artCheckAndAllocArrayFromCodeWithAccessCheck, RETURN_IF_EAX_NOT_ZERO
+// Generate the allocation entrypoints for each allocator.
+GENERATE_ALL_ALLOC_ENTRYPOINTS
 
-TWO_ARG_DOWNCALL art_quick_resolve_string, artResolveStringFromCode, RETURN_IF_EAX_NOT_ZERO
-TWO_ARG_DOWNCALL art_quick_initialize_static_storage, artInitializeStaticStorageFromCode, RETURN_IF_EAX_NOT_ZERO
-TWO_ARG_DOWNCALL art_quick_initialize_type, artInitializeTypeFromCode, RETURN_IF_EAX_NOT_ZERO
-TWO_ARG_DOWNCALL art_quick_initialize_type_and_verify_access, artInitializeTypeAndVerifyAccessFromCode, RETURN_IF_EAX_NOT_ZERO
-
-ONE_ARG_DOWNCALL art_quick_lock_object, artLockObjectFromCode, ret
-ONE_ARG_DOWNCALL art_quick_unlock_object, artUnlockObjectFromCode, RETURN_IF_EAX_ZERO
+TWO_ARG_DOWNCALL art_quick_resolve_string, artResolveStringFromCode, RETURN_IF_RESULT_IS_NON_ZERO
+TWO_ARG_DOWNCALL art_quick_initialize_static_storage, artInitializeStaticStorageFromCode, RETURN_IF_RESULT_IS_NON_ZERO
+TWO_ARG_DOWNCALL art_quick_initialize_type, artInitializeTypeFromCode, RETURN_IF_RESULT_IS_NON_ZERO
+TWO_ARG_DOWNCALL art_quick_initialize_type_and_verify_access, artInitializeTypeAndVerifyAccessFromCode, RETURN_IF_RESULT_IS_NON_ZERO
 
 TWO_ARG_DOWNCALL art_quick_handle_fill_data, artHandleFillArrayDataFromCode, RETURN_IF_EAX_ZERO
 
+DEFINE_FUNCTION art_quick_lock_object
+    testl %eax, %eax                      // null check object/eax
+    jz   slow_lock
+retry_lock:
+    movl LOCK_WORD_OFFSET(%eax), %ecx     // ecx := lock word
+    test LITERAL(0xC0000000), %ecx        // test the 2 high bits.
+    jne  slow_lock                        // slow path if either of the two high bits are set.
+    movl %fs:THREAD_ID_OFFSET, %edx       // edx := thread id
+    test %ecx, %ecx
+    jnz  already_thin                     // lock word contains a thin lock
+    // unlocked case - %edx holds thread id with count of 0
+    movl %eax, %ecx                       // remember object in case of retry
+    xor  %eax, %eax                       // eax == 0 for comparison with lock word in cmpxchg
+    lock cmpxchg  %edx, LOCK_WORD_OFFSET(%ecx)
+    jnz  cmpxchg_fail                     // cmpxchg failed retry
+    ret
+cmpxchg_fail:
+    movl  %ecx, %eax                       // restore eax
+    jmp  retry_lock
+already_thin:
+    cmpw %ax, %dx                         // do we hold the lock already?
+    jne  slow_lock
+    addl LITERAL(65536), %eax             // increment recursion count
+    test LITERAL(0xC0000000), %eax        // overflowed if either of top two bits are set
+    jne  slow_lock                        // count overflowed so go slow
+    movl %eax, LOCK_WORD_OFFSET(%ecx)     // update lockword, cmpxchg not necessary as we hold lock
+    ret
+slow_lock:
+    SETUP_REF_ONLY_CALLEE_SAVE_FRAME  // save ref containing registers for GC
+    mov %esp, %edx                // remember SP
+    // Outgoing argument set up
+    PUSH eax                      // push padding
+    PUSH edx                      // pass SP
+    pushl %fs:THREAD_SELF_OFFSET  // pass Thread::Current()
+    .cfi_adjust_cfa_offset 4
+    PUSH eax                      // pass object
+    call artLockObjectFromCode    // artLockObjectFromCode(object, Thread*, SP)
+    addl MACRO_LITERAL(16), %esp  // pop arguments
+    .cfi_adjust_cfa_offset -16
+    RESTORE_REF_ONLY_CALLEE_SAVE_FRAME  // restore frame up to return address
+    RETURN_IF_EAX_ZERO
+END_FUNCTION art_quick_lock_object
+
+DEFINE_FUNCTION art_quick_unlock_object
+    testl %eax, %eax                      // null check object/eax
+    jz   slow_unlock
+    movl LOCK_WORD_OFFSET(%eax), %ecx     // ecx := lock word
+    movl %fs:THREAD_ID_OFFSET, %edx       // edx := thread id
+    test %ecx, %ecx
+    jb   slow_unlock                      // lock word contains a monitor
+    cmpw %cx, %dx                         // does the thread id match?
+    jne  slow_unlock
+    cmpl LITERAL(65536), %ecx
+    jae  recursive_thin_unlock
+    movl LITERAL(0), LOCK_WORD_OFFSET(%eax)
+    ret
+recursive_thin_unlock:
+    subl LITERAL(65536), %ecx
+    mov  %ecx, LOCK_WORD_OFFSET(%eax)
+    ret
+slow_unlock:
+    SETUP_REF_ONLY_CALLEE_SAVE_FRAME  // save ref containing registers for GC
+    mov %esp, %edx                // remember SP
+    // Outgoing argument set up
+    PUSH eax                      // push padding
+    PUSH edx                      // pass SP
+    pushl %fs:THREAD_SELF_OFFSET  // pass Thread::Current()
+    .cfi_adjust_cfa_offset 4
+    PUSH eax                      // pass object
+    call artUnlockObjectFromCode    // artUnlockObjectFromCode(object, Thread*, SP)
+    addl MACRO_LITERAL(16), %esp  // pop arguments
+    .cfi_adjust_cfa_offset -16
+    RESTORE_REF_ONLY_CALLEE_SAVE_FRAME  // restore frame up to return address
+    RETURN_IF_EAX_ZERO
+END_FUNCTION art_quick_unlock_object
+
 DEFINE_FUNCTION art_quick_is_assignable
     PUSH eax                     // alignment padding
-    PUSH ecx                    // pass arg2
-    PUSH eax                     // pass arg1
-    call SYMBOL(artIsAssignableFromCode)  // (Class* a, Class* b, Thread*, SP)
+    PUSH ecx                     // pass arg2 - obj->klass
+    PUSH eax                     // pass arg1 - checked class
+    call SYMBOL(artIsAssignableFromCode)  // (Class* klass, Class* ref_klass)
     addl LITERAL(12), %esp        // pop arguments
     .cfi_adjust_cfa_offset -12
     ret
 END_FUNCTION art_quick_is_assignable
+
+DEFINE_FUNCTION art_quick_check_cast
+    PUSH eax                     // alignment padding
+    PUSH ecx                     // pass arg2 - obj->klass
+    .cfi_rel_offset ecx, -12
+    PUSH eax                     // pass arg1 - checked class
+    .cfi_rel_offset eax, -16
+    call SYMBOL(artIsAssignableFromCode)  // (Class* klass, Class* ref_klass)
+    testl %eax, %eax
+    jz 1f                         // jump forward if not assignable
+    addl LITERAL(12), %esp        // pop arguments
+    .cfi_adjust_cfa_offset -12
+    ret
+1:
+    POP eax                       // pop arguments
+    .cfi_restore eax
+    POP ecx
+    .cfi_restore ecx
+    addl LITERAL(4), %esp
+    .cfi_adjust_cfa_offset -12
+    SETUP_SAVE_ALL_CALLEE_SAVE_FRAME  // save all registers as basis for long jump context
+    mov %esp, %edx
+    // Outgoing argument set up
+    PUSH edx                      // pass SP
+    pushl %fs:THREAD_SELF_OFFSET  // pass Thread::Current()
+    .cfi_adjust_cfa_offset 4
+    PUSH ecx                      // pass arg2
+    PUSH eax                      // pass arg1
+    call SYMBOL(artThrowClassCastException) // (Class* a, Class* b, Thread*, SP)
+    int3                          // unreached
+END_FUNCTION art_quick_check_cast
+
+    /*
+     * Entry from managed code for array put operations of objects where the value being stored
+     * needs to be checked for compatibility.
+     * eax = array, ecx = index, edx = value
+     */
+DEFINE_FUNCTION art_quick_aput_obj_with_null_and_bound_check
+    testl %eax, %eax
+    jnz art_quick_aput_obj_with_bound_check
+    jmp art_quick_throw_null_pointer_exception
+END_FUNCTION art_quick_aput_obj_with_null_and_bound_check
+
+DEFINE_FUNCTION art_quick_aput_obj_with_bound_check
+    movl ARRAY_LENGTH_OFFSET(%eax), %ebx
+    cmpl %ebx, %ecx
+    jb art_quick_aput_obj
+    mov %ecx, %eax
+    mov %ebx, %ecx
+    jmp art_quick_throw_array_bounds
+END_FUNCTION art_quick_aput_obj_with_bound_check
+
+DEFINE_FUNCTION art_quick_aput_obj
+    test %edx, %edx              // store of null
+    jz do_aput_null
+    movl CLASS_OFFSET(%eax), %ebx
+    movl CLASS_COMPONENT_TYPE_OFFSET(%ebx), %ebx
+    cmpl CLASS_OFFSET(%edx), %ebx // value's type == array's component type - trivial assignability
+    jne check_assignability
+do_aput:
+    movl %edx, OBJECT_ARRAY_DATA_OFFSET(%eax, %ecx, 4)
+    movl %fs:THREAD_CARD_TABLE_OFFSET, %edx
+    shrl LITERAL(7), %eax
+    movb %dl, (%edx, %eax)
+    ret
+do_aput_null:
+    movl %edx, OBJECT_ARRAY_DATA_OFFSET(%eax, %ecx, 4)
+    ret
+check_assignability:
+    PUSH eax                     // save arguments
+    PUSH ecx
+    PUSH edx
+    subl LITERAL(8), %esp        // alignment padding
+    .cfi_adjust_cfa_offset 8
+    pushl CLASS_OFFSET(%edx)     // pass arg2 - type of the value to be stored
+    .cfi_adjust_cfa_offset 4
+    PUSH ebx                     // pass arg1 - component type of the array
+    call SYMBOL(artIsAssignableFromCode)  // (Class* a, Class* b)
+    addl LITERAL(16), %esp       // pop arguments
+    .cfi_adjust_cfa_offset -16
+    testl %eax, %eax
+    jz   throw_array_store_exception
+    POP  edx
+    POP  ecx
+    POP  eax
+    movl %edx, OBJECT_ARRAY_DATA_OFFSET(%eax, %ecx, 4)  // do the aput
+    movl %fs:THREAD_CARD_TABLE_OFFSET, %edx
+    shrl LITERAL(7), %eax
+    movb %dl, (%edx, %eax)
+    ret
+throw_array_store_exception:
+    POP  edx
+    POP  ecx
+    POP  eax
+    SETUP_SAVE_ALL_CALLEE_SAVE_FRAME  // save all registers as basis for long jump context
+    mov %esp, %ecx
+    // Outgoing argument set up
+    PUSH ecx                      // pass SP
+    pushl %fs:THREAD_SELF_OFFSET  // pass Thread::Current()
+    .cfi_adjust_cfa_offset 4
+    PUSH edx                      // pass arg2 - value
+    PUSH eax                      // pass arg1 - array
+    call SYMBOL(artThrowArrayStoreException) // (array, value, Thread*, SP)
+    int3                          // unreached
+END_FUNCTION art_quick_aput_obj
 
 DEFINE_FUNCTION art_quick_memcpy
     PUSH edx                      // pass arg3
@@ -418,9 +638,6 @@ DEFINE_FUNCTION art_quick_memcpy
     .cfi_adjust_cfa_offset -12
     ret
 END_FUNCTION art_quick_memcpy
-
-TWO_ARG_DOWNCALL art_quick_check_cast, artCheckCastFromCode, RETURN_IF_EAX_ZERO
-TWO_ARG_DOWNCALL art_quick_can_put_array_element, artCanPutArrayElementFromCode, RETURN_IF_EAX_ZERO
 
 NO_ARG_DOWNCALL art_quick_test_suspend, artTestSuspendFromCode, ret
 
@@ -508,30 +725,30 @@ check_arg2:
 END_FUNCTION art_quick_idivmod
 
 DEFINE_FUNCTION art_quick_ldiv
-    subl LITERAL(12), %esp        // alignment padding
+    subl LITERAL(12), %esp       // alignment padding
     .cfi_adjust_cfa_offset 12
     PUSH ebx                     // pass arg4 b.hi
     PUSH edx                     // pass arg3 b.lo
     PUSH ecx                     // pass arg2 a.hi
-    PUSH eax                      // pass arg1 a.lo
-    call SYMBOL(artLdivFromCode)  // (jlong a, jlong b)
-    addl LITERAL(28), %esp        // pop arguments
+    PUSH eax                     // pass arg1 a.lo
+    call SYMBOL(artLdiv)         // (jlong a, jlong b)
+    addl LITERAL(28), %esp       // pop arguments
     .cfi_adjust_cfa_offset -28
     ret
 END_FUNCTION art_quick_ldiv
 
-DEFINE_FUNCTION art_quick_ldivmod
-    subl LITERAL(12), %esp        // alignment padding
+DEFINE_FUNCTION art_quick_lmod
+    subl LITERAL(12), %esp       // alignment padding
     .cfi_adjust_cfa_offset 12
     PUSH ebx                     // pass arg4 b.hi
     PUSH edx                     // pass arg3 b.lo
     PUSH ecx                     // pass arg2 a.hi
-    PUSH eax                      // pass arg1 a.lo
-    call SYMBOL(artLdivmodFromCode) // (jlong a, jlong b)
-    addl LITERAL(28), %esp        // pop arguments
+    PUSH eax                     // pass arg1 a.lo
+    call SYMBOL(artLmod)         // (jlong a, jlong b)
+    addl LITERAL(28), %esp       // pop arguments
     .cfi_adjust_cfa_offset -28
     ret
-END_FUNCTION art_quick_ldivmod
+END_FUNCTION art_quick_lmod
 
 DEFINE_FUNCTION art_quick_lmul
     imul %eax, %ebx              // ebx = a.lo(eax) * b.hi(ebx)
@@ -818,6 +1035,20 @@ DEFINE_FUNCTION art_quick_proxy_invoke_handler
     RETURN_OR_DELIVER_PENDING_EXCEPTION    // return or deliver exception
 END_FUNCTION art_quick_proxy_invoke_handler
 
+    /*
+     * Called to resolve an imt conflict. xmm0 is a hidden argument that holds the target method's
+     * dex method index.
+     */
+DEFINE_FUNCTION art_quick_imt_conflict_trampoline
+    PUSH ecx
+    movl 8(%esp), %eax            // load caller Method*
+    movl METHOD_DEX_CACHE_METHODS_OFFSET(%eax), %eax  // load dex_cache_resolved_methods
+    movd %xmm0, %ecx              // get target method index stored in xmm0
+    movl OBJECT_ARRAY_DATA_OFFSET(%eax, %ecx, 4), %eax  // load the target method
+    POP ecx
+    jmp art_quick_invoke_interface_trampoline
+END_FUNCTION art_quick_imt_conflict_trampoline
+
 DEFINE_FUNCTION art_quick_resolution_trampoline
     SETUP_REF_AND_ARGS_CALLEE_SAVE_FRAME
     PUSH esp                      // pass SP
@@ -855,8 +1086,9 @@ DEFINE_FUNCTION art_quick_to_interpreter_bridge
     movd %eax, %xmm0              // place return value also into floating point return value
     movd %edx, %xmm1
     punpckldq %xmm1, %xmm0
-    addl LITERAL(44), %esp        // pop arguments
-    .cfi_adjust_cfa_offset -44
+    addl LITERAL(16), %esp        // pop arguments
+    .cfi_adjust_cfa_offset -16
+    RESTORE_REF_ONLY_CALLEE_SAVE_FRAME
     RETURN_OR_DELIVER_PENDING_EXCEPTION    // return or deliver exception
 END_FUNCTION art_quick_to_interpreter_bridge
 

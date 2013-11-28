@@ -75,6 +75,7 @@ Runtime::Runtime()
       is_explicit_gc_disabled_(false),
       default_stack_size_(0),
       heap_(NULL),
+      max_spins_before_thin_lock_inflation_(Monitor::kDefaultMaxSpinsBeforeThinLockInflation),
       monitor_list_(NULL),
       thread_list_(NULL),
       intern_table_(NULL),
@@ -83,6 +84,8 @@ Runtime::Runtime()
       java_vm_(NULL),
       pre_allocated_OutOfMemoryError_(NULL),
       resolution_method_(NULL),
+      imt_conflict_method_(NULL),
+      default_imt_(NULL),
       threads_being_born_(0),
       shutdown_cond_(new ConditionVariable("Runtime shutdown", *Locks::runtime_shutdown_lock_)),
       shutting_down_(false),
@@ -106,6 +109,13 @@ Runtime::Runtime()
 }
 
 Runtime::~Runtime() {
+  if (dump_gc_performance_on_shutdown_) {
+    // This can't be called from the Heap destructor below because it
+    // could call RosAlloc::InspectAll() which needs the thread_list
+    // to be still alive.
+    heap_->DumpGcPerformanceInfo(LOG(INFO));
+  }
+
   Thread* self = Thread::Current();
   {
     MutexLock mu(self, *Locks::runtime_shutdown_lock_);
@@ -118,8 +128,13 @@ Runtime::~Runtime() {
   Trace::Shutdown();
 
   // Make sure to let the GC complete if it is running.
-  heap_->WaitForConcurrentGcToComplete(self);
+  heap_->WaitForGcToComplete(self);
   heap_->DeleteThreadPool();
+
+  // For RosAlloc, revoke thread local runs. Note that in tests
+  // (common_test.h) we repeat allocating and deleting Runtime
+  // objects.
+  heap_->RevokeAllThreadLocalBuffers();
 
   // Make sure our internal threads are dead before we start tearing down things they're using.
   Dbg::StopJdwp();
@@ -319,6 +334,12 @@ size_t ParseIntegerOrDie(const std::string& s) {
   return result;
 }
 
+void Runtime::SweepSystemWeaks(RootVisitor* visitor, void* arg) {
+  GetInternTable()->SweepInternTableWeaks(visitor, arg);
+  GetMonitorList()->SweepMonitorList(visitor, arg);
+  GetJavaVM()->SweepJniWeakGlobals(visitor, arg);
+}
+
 Runtime::ParsedOptions* Runtime::ParsedOptions::Create(const Options& options, bool ignore_unrecognized) {
   UniquePtr<ParsedOptions> parsed(new ParsedOptions());
   const char* boot_class_path_string = getenv("BOOTCLASSPATH");
@@ -342,17 +363,20 @@ Runtime::ParsedOptions* Runtime::ParsedOptions::Create(const Options& options, b
   parsed->parallel_gc_threads_ = sysconf(_SC_NPROCESSORS_CONF) - 1;
   // Only the main GC thread, no workers.
   parsed->conc_gc_threads_ = 0;
+  // Default is CMS which is Sticky + Partial + Full CMS GC.
+  parsed->collector_type_ = gc::kCollectorTypeCMS;
   parsed->stack_size_ = 0;  // 0 means default.
+  parsed->max_spins_before_thin_lock_inflation_ = Monitor::kDefaultMaxSpinsBeforeThinLockInflation;
   parsed->low_memory_mode_ = false;
 
   parsed->is_compiler_ = false;
   parsed->is_zygote_ = false;
   parsed->interpreter_only_ = false;
-  parsed->is_concurrent_gc_enabled_ = true;
   parsed->is_explicit_gc_disabled_ = false;
 
   parsed->long_pause_log_threshold_ = gc::Heap::kDefaultLongPauseLogThreshold;
   parsed->long_gc_log_threshold_ = gc::Heap::kDefaultLongGCLogThreshold;
+  parsed->dump_gc_performance_on_shutdown_ = false;
   parsed->ignore_max_footprint_ = false;
 
   parsed->lock_profiling_threshold_ = 0;
@@ -503,12 +527,18 @@ Runtime::ParsedOptions* Runtime::ParsedOptions::Create(const Options& options, b
         return NULL;
       }
       parsed->stack_size_ = size;
+    } else if (StartsWith(option, "-XX:MaxSpinsBeforeThinLockInflation=")) {
+      parsed->max_spins_before_thin_lock_inflation_ =
+          strtoul(option.substr(strlen("-XX:MaxSpinsBeforeThinLockInflation=")).c_str(),
+                  nullptr, 10);
     } else if (option == "-XX:LongPauseLogThreshold") {
       parsed->long_pause_log_threshold_ =
           ParseMemoryOption(option.substr(strlen("-XX:LongPauseLogThreshold=")).c_str(), 1024);
     } else if (option == "-XX:LongGCLogThreshold") {
           parsed->long_gc_log_threshold_ =
               ParseMemoryOption(option.substr(strlen("-XX:LongGCLogThreshold")).c_str(), 1024);
+    } else if (option == "-XX:DumpGCPerformanceOnShutdown") {
+      parsed->dump_gc_performance_on_shutdown_ = true;
     } else if (option == "-XX:IgnoreMaxFootprint") {
       parsed->ignore_max_footprint_ = true;
     } else if (option == "-XX:LowMemoryMode") {
@@ -527,10 +557,12 @@ Runtime::ParsedOptions* Runtime::ParsedOptions::Create(const Options& options, b
       std::vector<std::string> gc_options;
       Split(option.substr(strlen("-Xgc:")), ',', gc_options);
       for (size_t i = 0; i < gc_options.size(); ++i) {
-        if (gc_options[i] == "noconcurrent") {
-          parsed->is_concurrent_gc_enabled_ = false;
-        } else if (gc_options[i] == "concurrent") {
-          parsed->is_concurrent_gc_enabled_ = true;
+        if (gc_options[i] == "MS" || gc_options[i] == "nonconcurrent") {
+          parsed->collector_type_ = gc::kCollectorTypeMS;
+        } else if (gc_options[i] == "CMS" || gc_options[i] == "concurrent") {
+          parsed->collector_type_ = gc::kCollectorTypeCMS;
+        } else if (gc_options[i] == "SS") {
+          parsed->collector_type_ = gc::kCollectorTypeSS;
         } else {
           LOG(WARNING) << "Ignoring unknown -Xgc option: " << gc_options[i];
         }
@@ -807,6 +839,11 @@ void Runtime::StartSignalCatcher() {
   }
 }
 
+bool Runtime::IsShuttingDown(Thread* self) {
+  MutexLock mu(self, *Locks::runtime_shutdown_lock_);
+  return IsShuttingDownLocked();
+}
+
 void Runtime::StartDaemonThreads() {
   VLOG(startup) << "Runtime::StartDaemonThreads entering";
 
@@ -847,7 +884,6 @@ bool Runtime::Init(const Options& raw_options, bool ignore_unrecognized) {
 
   is_compiler_ = options->is_compiler_;
   is_zygote_ = options->is_zygote_;
-  is_concurrent_gc_enabled_ = options->is_concurrent_gc_enabled_;
   is_explicit_gc_disabled_ = options->is_explicit_gc_disabled_;
 
   compiler_filter_ = options->compiler_filter_;
@@ -865,6 +901,8 @@ bool Runtime::Init(const Options& raw_options, bool ignore_unrecognized) {
   default_stack_size_ = options->stack_size_;
   stack_trace_file_ = options->stack_trace_file_;
 
+  max_spins_before_thin_lock_inflation_ = options->max_spins_before_thin_lock_inflation_;
+
   monitor_list_ = new MonitorList;
   thread_list_ = new ThreadList;
   intern_table_ = new InternTable;
@@ -881,13 +919,15 @@ bool Runtime::Init(const Options& raw_options, bool ignore_unrecognized) {
                        options->heap_target_utilization_,
                        options->heap_maximum_size_,
                        options->image_,
-                       options->is_concurrent_gc_enabled_,
+                       options->collector_type_,
                        options->parallel_gc_threads_,
                        options->conc_gc_threads_,
                        options->low_memory_mode_,
                        options->long_pause_log_threshold_,
                        options->long_gc_log_threshold_,
                        options->ignore_max_footprint_);
+
+  dump_gc_performance_on_shutdown_ = options->dump_gc_performance_on_shutdown_;
 
   BlockSignals();
   InitPlatformSignalHandlers();
@@ -900,7 +940,7 @@ bool Runtime::Init(const Options& raw_options, bool ignore_unrecognized) {
   // objects. We can't supply a thread group yet; it will be fixed later. Since we are the main
   // thread, we do not get a java peer.
   Thread* self = Thread::Attach("main", false, NULL, false);
-  CHECK_EQ(self->thin_lock_id_, ThreadList::kMainId);
+  CHECK_EQ(self->thin_lock_thread_id_, ThreadList::kMainThreadId);
   CHECK(self != NULL);
 
   // Set us to runnable so tools using a runtime can allocate and GC by default
@@ -910,12 +950,13 @@ bool Runtime::Init(const Options& raw_options, bool ignore_unrecognized) {
   GetHeap()->EnableObjectValidation();
 
   CHECK_GE(GetHeap()->GetContinuousSpaces().size(), 1U);
-  if (GetHeap()->GetContinuousSpaces()[0]->IsImageSpace()) {
-    class_linker_ = ClassLinker::CreateFromImage(intern_table_);
+  class_linker_ = new ClassLinker(intern_table_);
+  if (GetHeap()->HasImageSpace()) {
+    class_linker_->InitFromImage();
   } else {
     CHECK(options->boot_class_path_ != NULL);
     CHECK_NE(options->boot_class_path_->size(), 0U);
-    class_linker_ = ClassLinker::CreateFromCompiler(*options->boot_class_path_, intern_table_);
+    class_linker_->InitFromCompiler(*options->boot_class_path_);
   }
   CHECK(class_linker_ != NULL);
   verifier::MethodVerifier::Init();
@@ -962,7 +1003,7 @@ void Runtime::InitNativeMethods() {
     std::string mapped_name(StringPrintf(OS_SHARED_LIB_FORMAT_STR, "javacore"));
     std::string reason;
     self->TransitionFromSuspendedToRunnable();
-    if (!instance_->java_vm_->LoadNativeLibrary(mapped_name, NULL, reason)) {
+    if (!instance_->java_vm_->LoadNativeLibrary(mapped_name, NULL, &reason)) {
       LOG(FATAL) << "LoadNativeLibrary failed for \"" << mapped_name << "\": " << reason;
     }
     self->TransitionFromRunnableToSuspended(kNative);
@@ -1060,6 +1101,9 @@ void Runtime::SetStatsEnabled(bool new_state) {
     GetStats()->Clear(~0);
     // TODO: wouldn't it make more sense to clear _all_ threads' stats?
     Thread::Current()->GetStats()->Clear(~0);
+    GetInstrumentation()->InstrumentQuickAllocEntryPoints();
+  } else {
+    GetInstrumentation()->UninstrumentQuickAllocEntryPoints();
   }
   stats_enabled_ = new_state;
 }
@@ -1150,12 +1194,25 @@ void Runtime::VisitConcurrentRoots(RootVisitor* visitor, void* arg, bool only_di
 
 void Runtime::VisitNonThreadRoots(RootVisitor* visitor, void* arg) {
   java_vm_->VisitRoots(visitor, arg);
-  if (pre_allocated_OutOfMemoryError_ != NULL) {
-    visitor(pre_allocated_OutOfMemoryError_, arg);
+  if (pre_allocated_OutOfMemoryError_ != nullptr) {
+    pre_allocated_OutOfMemoryError_ = reinterpret_cast<mirror::Throwable*>(
+        visitor(pre_allocated_OutOfMemoryError_, arg));
+    DCHECK(pre_allocated_OutOfMemoryError_ != nullptr);
   }
-  visitor(resolution_method_, arg);
+  resolution_method_ = down_cast<mirror::ArtMethod*>(visitor(resolution_method_, arg));
+  DCHECK(resolution_method_ != nullptr);
+  if (HasImtConflictMethod()) {
+    imt_conflict_method_ = down_cast<mirror::ArtMethod*>(visitor(imt_conflict_method_, arg));
+  }
+  if (HasDefaultImt()) {
+    default_imt_ = down_cast<mirror::ObjectArray<mirror::ArtMethod>*>(visitor(default_imt_, arg));
+  }
+
   for (int i = 0; i < Runtime::kLastCalleeSaveType; i++) {
-    visitor(callee_save_methods_[i], arg);
+    if (callee_save_methods_[i] != nullptr) {
+      callee_save_methods_[i] = down_cast<mirror::ArtMethod*>(
+          visitor(callee_save_methods_[i], arg));
+    }
   }
 }
 
@@ -1169,28 +1226,49 @@ void Runtime::VisitRoots(RootVisitor* visitor, void* arg, bool only_dirty, bool 
   VisitNonConcurrentRoots(visitor, arg);
 }
 
-mirror::ArtMethod* Runtime::CreateResolutionMethod() {
-  mirror::Class* method_class = mirror::ArtMethod::GetJavaLangReflectArtMethod();
+mirror::ObjectArray<mirror::ArtMethod>* Runtime::CreateDefaultImt(ClassLinker* cl) {
   Thread* self = Thread::Current();
-  SirtRef<mirror::ArtMethod>
-      method(self, down_cast<mirror::ArtMethod*>(method_class->AllocObject(self)));
-  method->SetDeclaringClass(method_class);
+  SirtRef<mirror::ObjectArray<mirror::ArtMethod> > imtable(self, cl->AllocArtMethodArray(self, 64));
+  mirror::ArtMethod* imt_conflict_method = Runtime::Current()->GetImtConflictMethod();
+  for (size_t i = 0; i < static_cast<size_t>(imtable->GetLength()); i++) {
+    imtable->Set(i, imt_conflict_method);
+  }
+  return imtable.get();
+}
+
+mirror::ArtMethod* Runtime::CreateImtConflictMethod() {
+  Thread* self = Thread::Current();
+  Runtime* r = Runtime::Current();
+  ClassLinker* cl = r->GetClassLinker();
+  SirtRef<mirror::ArtMethod> method(self, cl->AllocArtMethod(self));
+  method->SetDeclaringClass(mirror::ArtMethod::GetJavaLangReflectArtMethod());
+  // TODO: use a special method for imt conflict method saves
+  method->SetDexMethodIndex(DexFile::kDexNoIndex);
+  // When compiling, the code pointer will get set later when the image is loaded.
+  method->SetEntryPointFromCompiledCode(r->IsCompiler() ? NULL : GetImtConflictTrampoline(cl));
+  return method.get();
+}
+
+mirror::ArtMethod* Runtime::CreateResolutionMethod() {
+  Thread* self = Thread::Current();
+  Runtime* r = Runtime::Current();
+  ClassLinker* cl = r->GetClassLinker();
+  SirtRef<mirror::ArtMethod> method(self, cl->AllocArtMethod(self));
+  method->SetDeclaringClass(mirror::ArtMethod::GetJavaLangReflectArtMethod());
   // TODO: use a special method for resolution method saves
   method->SetDexMethodIndex(DexFile::kDexNoIndex);
   // When compiling, the code pointer will get set later when the image is loaded.
-  Runtime* r = Runtime::Current();
-  ClassLinker* cl = r->GetClassLinker();
   method->SetEntryPointFromCompiledCode(r->IsCompiler() ? NULL : GetResolutionTrampoline(cl));
   return method.get();
 }
 
 mirror::ArtMethod* Runtime::CreateCalleeSaveMethod(InstructionSet instruction_set,
-                                                        CalleeSaveType type) {
-  mirror::Class* method_class = mirror::ArtMethod::GetJavaLangReflectArtMethod();
+                                                   CalleeSaveType type) {
   Thread* self = Thread::Current();
-  SirtRef<mirror::ArtMethod>
-      method(self, down_cast<mirror::ArtMethod*>(method_class->AllocObject(self)));
-  method->SetDeclaringClass(method_class);
+  Runtime* r = Runtime::Current();
+  ClassLinker* cl = r->GetClassLinker();
+  SirtRef<mirror::ArtMethod> method(self, cl->AllocArtMethod(self));
+  method->SetDeclaringClass(mirror::ArtMethod::GetJavaLangReflectArtMethod());
   // TODO: use a special method for callee saves
   method->SetDexMethodIndex(DexFile::kDexNoIndex);
   method->SetEntryPointFromCompiledCode(NULL);

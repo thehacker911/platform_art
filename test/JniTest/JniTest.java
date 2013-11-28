@@ -14,11 +14,54 @@
  * limitations under the License.
  */
 
+import java.lang.reflect.Method;
+
 class JniTest {
     public static void main(String[] args) {
         System.loadLibrary("arttest");
         testFindClassOnAttachedNativeThread();
+        testCallStaticVoidMethodOnSubClass();
+        testGetMirandaMethod();
     }
 
     private static native void testFindClassOnAttachedNativeThread();
+
+    private static void testCallStaticVoidMethodOnSubClass() {
+        testCallStaticVoidMethodOnSubClassNative();
+        if (!testCallStaticVoidMethodOnSubClass_SuperClass.executed) {
+            throw new AssertionError();
+        }
+    }
+
+    private static native void testCallStaticVoidMethodOnSubClassNative();
+
+    private static class testCallStaticVoidMethodOnSubClass_SuperClass {
+        private static boolean executed = false;
+        private static void execute() {
+            executed = true;
+        }
+    }
+
+    private static class testCallStaticVoidMethodOnSubClass_SubClass
+        extends testCallStaticVoidMethodOnSubClass_SuperClass {
+    }
+
+    private static native Method testGetMirandaMethodNative();
+
+    private static void testGetMirandaMethod() {
+        Method m = testGetMirandaMethodNative();
+        if (m.getDeclaringClass() != testGetMirandaMethod_MirandaInterface.class) {
+            throw new AssertionError();
+        }
+    }
+
+    private static abstract class testGetMirandaMethod_MirandaAbstract implements testGetMirandaMethod_MirandaInterface {
+        public boolean inAbstract() {
+            return true;
+        }
+    }
+
+    private static interface testGetMirandaMethod_MirandaInterface {
+        public boolean inInterface();
+    }
 }

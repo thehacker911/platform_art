@@ -39,7 +39,17 @@
 #include "thread_list.h"
 
 namespace art {
+
+extern void SetQuickAllocEntryPointsInstrumented(bool instrumented);
+
 namespace instrumentation {
+
+const bool kVerboseInstrumentation = false;
+
+// Do we want to deoptimize for method entry and exit listeners or just try to intercept
+// invocations? Deoptimization forces all code to run in the interpreter and considerably hurts the
+// application's performance.
+static constexpr bool kDeoptimizeForAccurateMethodEntryExitListeners = false;
 
 static bool InstallStubsClassVisitor(mirror::Class* klass, void* arg)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
@@ -49,17 +59,14 @@ static bool InstallStubsClassVisitor(mirror::Class* klass, void* arg)
 
 bool Instrumentation::InstallStubsForClass(mirror::Class* klass) {
   bool uninstall = !entry_exit_stubs_installed_ && !interpreter_stubs_installed_;
-  ClassLinker* class_linker = NULL;
-  if (uninstall) {
-    class_linker = Runtime::Current()->GetClassLinker();
-  }
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   bool is_initialized = klass->IsInitialized();
   for (size_t i = 0; i < klass->NumDirectMethods(); i++) {
     mirror::ArtMethod* method = klass->GetDirectMethod(i);
-    if (!method->IsAbstract()) {
+    if (!method->IsAbstract() && !method->IsProxyMethod()) {
       const void* new_code;
       if (uninstall) {
-        if (forced_interpret_only_ && !method->IsNative() && !method->IsProxyMethod()) {
+        if (forced_interpret_only_ && !method->IsNative()) {
           new_code = GetCompiledCodeToInterpreterBridge();
         } else if (is_initialized || !method->IsStatic() || method->IsConstructor()) {
           new_code = class_linker->GetOatCodeFor(method);
@@ -68,7 +75,14 @@ bool Instrumentation::InstallStubsForClass(mirror::Class* klass) {
         }
       } else {  // !uninstall
         if (!interpreter_stubs_installed_ || method->IsNative()) {
-          new_code = GetQuickInstrumentationEntryPoint();
+          // Do not overwrite resolution trampoline. When the trampoline initializes the method's
+          // class, all its static methods' code will be set to the instrumentation entry point.
+          // For more details, see ClassLinker::FixupStaticTrampolines.
+          if (is_initialized || !method->IsStatic() || method->IsConstructor()) {
+            new_code = GetQuickInstrumentationEntryPoint();
+          } else {
+            new_code = GetResolutionTrampoline(class_linker);
+          }
         } else {
           new_code = GetCompiledCodeToInterpreterBridge();
         }
@@ -78,10 +92,10 @@ bool Instrumentation::InstallStubsForClass(mirror::Class* klass) {
   }
   for (size_t i = 0; i < klass->NumVirtualMethods(); i++) {
     mirror::ArtMethod* method = klass->GetVirtualMethod(i);
-    if (!method->IsAbstract()) {
+    if (!method->IsAbstract() && !method->IsProxyMethod()) {
       const void* new_code;
       if (uninstall) {
-        if (forced_interpret_only_ && !method->IsNative() && !method->IsProxyMethod()) {
+        if (forced_interpret_only_ && !method->IsNative()) {
           new_code = GetCompiledCodeToInterpreterBridge();
         } else {
           new_code = class_linker->GetOatCodeFor(method);
@@ -264,12 +278,14 @@ void Instrumentation::AddListener(InstrumentationListener* listener, uint32_t ev
   bool require_interpreter = false;
   if ((events & kMethodEntered) != 0) {
     method_entry_listeners_.push_back(listener);
-    require_entry_exit_stubs = true;
+    require_interpreter = kDeoptimizeForAccurateMethodEntryExitListeners;
+    require_entry_exit_stubs = !kDeoptimizeForAccurateMethodEntryExitListeners;
     have_method_entry_listeners_ = true;
   }
   if ((events & kMethodExited) != 0) {
     method_exit_listeners_.push_back(listener);
-    require_entry_exit_stubs = true;
+    require_interpreter = kDeoptimizeForAccurateMethodEntryExitListeners;
+    require_entry_exit_stubs = !kDeoptimizeForAccurateMethodEntryExitListeners;
     have_method_exit_listeners_ = true;
   }
   if ((events & kMethodUnwind) != 0) {
@@ -286,6 +302,7 @@ void Instrumentation::AddListener(InstrumentationListener* listener, uint32_t ev
     have_exception_caught_listeners_ = true;
   }
   ConfigureStubs(require_entry_exit_stubs, require_interpreter);
+  UpdateInterpreterHandlerTable();
 }
 
 void Instrumentation::RemoveListener(InstrumentationListener* listener, uint32_t events) {
@@ -300,7 +317,10 @@ void Instrumentation::RemoveListener(InstrumentationListener* listener, uint32_t
       method_entry_listeners_.remove(listener);
     }
     have_method_entry_listeners_ = method_entry_listeners_.size() > 0;
-    require_entry_exit_stubs |= have_method_entry_listeners_;
+    require_entry_exit_stubs |= have_method_entry_listeners_ &&
+        !kDeoptimizeForAccurateMethodEntryExitListeners;
+    require_interpreter = have_method_entry_listeners_ &&
+        kDeoptimizeForAccurateMethodEntryExitListeners;
   }
   if ((events & kMethodExited) != 0) {
     bool contains = std::find(method_exit_listeners_.begin(), method_exit_listeners_.end(),
@@ -309,7 +329,10 @@ void Instrumentation::RemoveListener(InstrumentationListener* listener, uint32_t
       method_exit_listeners_.remove(listener);
     }
     have_method_exit_listeners_ = method_exit_listeners_.size() > 0;
-    require_entry_exit_stubs |= have_method_exit_listeners_;
+    require_entry_exit_stubs |= have_method_exit_listeners_ &&
+        !kDeoptimizeForAccurateMethodEntryExitListeners;
+    require_interpreter = have_method_exit_listeners_ &&
+        kDeoptimizeForAccurateMethodEntryExitListeners;
   }
   if ((events & kMethodUnwind) != 0) {
     method_unwind_listeners_.remove(listener);
@@ -328,6 +351,7 @@ void Instrumentation::RemoveListener(InstrumentationListener* listener, uint32_t
     have_exception_caught_listeners_ = exception_caught_listeners_.size() > 0;
   }
   ConfigureStubs(require_entry_exit_stubs, require_interpreter);
+  UpdateInterpreterHandlerTable();
 }
 
 void Instrumentation::ConfigureStubs(bool require_entry_exit_stubs, bool require_interpreter) {
@@ -376,12 +400,62 @@ void Instrumentation::ConfigureStubs(bool require_entry_exit_stubs, bool require
   }
 }
 
+static void ResetQuickAllocEntryPointsForThread(Thread* thread, void* arg) {
+  thread->ResetQuickAllocEntryPointsForThread();
+}
+
+void Instrumentation::InstrumentQuickAllocEntryPoints() {
+  // TODO: the read of quick_alloc_entry_points_instrumentation_counter_ is racey and this code
+  //       should be guarded by a lock.
+  DCHECK_GE(quick_alloc_entry_points_instrumentation_counter_.load(), 0);
+  const bool enable_instrumentation =
+      quick_alloc_entry_points_instrumentation_counter_.fetch_add(1) == 0;
+  if (enable_instrumentation) {
+    // Instrumentation wasn't enabled so enable it.
+    SetQuickAllocEntryPointsInstrumented(true);
+    ResetQuickAllocEntryPoints();
+  }
+}
+
+void Instrumentation::UninstrumentQuickAllocEntryPoints() {
+  // TODO: the read of quick_alloc_entry_points_instrumentation_counter_ is racey and this code
+  //       should be guarded by a lock.
+  DCHECK_GT(quick_alloc_entry_points_instrumentation_counter_.load(), 0);
+  const bool disable_instrumentation =
+      quick_alloc_entry_points_instrumentation_counter_.fetch_sub(1) == 1;
+  if (disable_instrumentation) {
+    SetQuickAllocEntryPointsInstrumented(false);
+    ResetQuickAllocEntryPoints();
+  }
+}
+
+void Instrumentation::ResetQuickAllocEntryPoints() {
+  Runtime* runtime = Runtime::Current();
+  if (runtime->IsStarted()) {
+    ThreadList* tl = runtime->GetThreadList();
+    Thread* self = Thread::Current();
+    tl->SuspendAll();
+    {
+      MutexLock mu(self, *Locks::thread_list_lock_);
+      tl->ForEach(ResetQuickAllocEntryPointsForThread, NULL);
+    }
+    tl->ResumeAll();
+  }
+}
+
 void Instrumentation::UpdateMethodsCode(mirror::ArtMethod* method, const void* code) const {
   if (LIKELY(!instrumentation_stubs_installed_)) {
     method->SetEntryPointFromCompiledCode(code);
   } else {
     if (!interpreter_stubs_installed_ || method->IsNative()) {
-      method->SetEntryPointFromCompiledCode(GetQuickInstrumentationEntryPoint());
+      // Do not overwrite resolution trampoline. When the trampoline initializes the method's
+      // class, all its static methods' code will be set to the instrumentation entry point.
+      // For more details, see ClassLinker::FixupStaticTrampolines.
+      if (code == GetResolutionTrampoline(Runtime::Current()->GetClassLinker())) {
+        method->SetEntryPointFromCompiledCode(code);
+      } else {
+        method->SetEntryPointFromCompiledCode(GetQuickInstrumentationEntryPoint());
+      }
     } else {
       method->SetEntryPointFromCompiledCode(GetCompiledCodeToInterpreterBridge());
     }
@@ -434,7 +508,7 @@ void Instrumentation::MethodUnwindEvent(Thread* thread, mirror::Object* this_obj
                                         uint32_t dex_pc) const {
   if (have_method_unwind_listeners_) {
     for (InstrumentationListener* listener : method_unwind_listeners_) {
-      listener->MethodUnwind(thread, method, dex_pc);
+      listener->MethodUnwind(thread, this_object, method, dex_pc);
     }
   }
 }
@@ -455,7 +529,7 @@ void Instrumentation::DexPcMovedEventImpl(Thread* thread, mirror::Object* this_o
 void Instrumentation::ExceptionCaughtEvent(Thread* thread, const ThrowLocation& throw_location,
                                            mirror::ArtMethod* catch_method,
                                            uint32_t catch_dex_pc,
-                                           mirror::Throwable* exception_object) {
+                                           mirror::Throwable* exception_object) const {
   if (have_exception_caught_listeners_) {
     DCHECK_EQ(thread->GetException(NULL), exception_object);
     thread->ClearException();

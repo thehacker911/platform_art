@@ -131,9 +131,13 @@ static void Usage(const char* fmt, ...) {
   UsageError("      Example: --instruction-set=x86");
   UsageError("      Default: arm");
   UsageError("");
+  UsageError("  --instruction-set-features=...,: Specify instruction set features");
+  UsageError("      Example: --instruction-set-features=div");
+  UsageError("      Default: default");
+  UsageError("");
   UsageError("  --compiler-backend=(Quick|QuickGBC|Portable): select compiler backend");
   UsageError("      set.");
-  UsageError("      Example: --instruction-set=Portable");
+  UsageError("      Example: --compiler-backend=Portable");
   UsageError("      Default: Quick");
   UsageError("");
   UsageError("  --host: used with Portable backend to link against host runtime libraries");
@@ -155,13 +159,15 @@ class Dex2Oat {
                      Runtime::Options& options,
                      CompilerBackend compiler_backend,
                      InstructionSet instruction_set,
+                     InstructionSetFeatures instruction_set_features,
                      size_t thread_count)
       SHARED_TRYLOCK_FUNCTION(true, Locks::mutator_lock_) {
     if (!CreateRuntime(options, instruction_set)) {
       *p_dex2oat = NULL;
       return false;
     }
-    *p_dex2oat = new Dex2Oat(Runtime::Current(), compiler_backend, instruction_set, thread_count);
+    *p_dex2oat = new Dex2Oat(Runtime::Current(), compiler_backend, instruction_set,
+        instruction_set_features, thread_count);
     return true;
   }
 
@@ -200,21 +206,24 @@ class Dex2Oat {
   }
 
   // Reads the class names (java.lang.Object) and returns a set of descriptors (Ljava/lang/Object;)
-  CompilerDriver::DescriptorSet* ReadImageClassesFromZip(const std::string& zip_filename,
-                                                         const char* image_classes_filename) {
-    UniquePtr<ZipArchive> zip_archive(ZipArchive::Open(zip_filename));
+  CompilerDriver::DescriptorSet* ReadImageClassesFromZip(const char* zip_filename,
+                                                         const char* image_classes_filename,
+                                                         std::string* error_msg) {
+    UniquePtr<ZipArchive> zip_archive(ZipArchive::Open(zip_filename, error_msg));
     if (zip_archive.get() == NULL) {
-      LOG(ERROR) << "Failed to open zip file " << zip_filename;
       return NULL;
     }
     UniquePtr<ZipEntry> zip_entry(zip_archive->Find(image_classes_filename));
     if (zip_entry.get() == NULL) {
-      LOG(ERROR) << "Failed to find " << image_classes_filename << " within " << zip_filename;
+      *error_msg = StringPrintf("Failed to find '%s' within '%s': %s", image_classes_filename,
+                                zip_filename, error_msg->c_str());
       return NULL;
     }
-    UniquePtr<MemMap> image_classes_file(zip_entry->ExtractToMemMap(image_classes_filename));
+    UniquePtr<MemMap> image_classes_file(zip_entry->ExtractToMemMap(image_classes_filename,
+                                                                    error_msg));
     if (image_classes_file.get() == NULL) {
-      LOG(ERROR) << "Failed to extract " << image_classes_filename << " from " << zip_filename;
+      *error_msg = StringPrintf("Failed to extract '%s' from '%s': %s", image_classes_filename,
+                                zip_filename, error_msg->c_str());
       return NULL;
     }
     const std::string image_classes_string(reinterpret_cast<char*>(image_classes_file->Begin()),
@@ -233,7 +242,7 @@ class Dex2Oat {
                                       bool image,
                                       UniquePtr<CompilerDriver::DescriptorSet>& image_classes,
                                       bool dump_stats,
-                                      base::TimingLogger& timings) {
+                                      TimingLogger& timings) {
     // SirtRef and ClassLoader creation needs to come after Runtime::Create
     jobject class_loader = NULL;
     Thread* self = Thread::Current();
@@ -254,6 +263,7 @@ class Dex2Oat {
 
     UniquePtr<CompilerDriver> driver(new CompilerDriver(compiler_backend_,
                                                         instruction_set_,
+                                                        instruction_set_features_,
                                                         image,
                                                         image_classes.release(),
                                                         thread_count_,
@@ -270,6 +280,7 @@ class Dex2Oat {
     uint32_t image_file_location_oat_checksum = 0;
     uint32_t image_file_location_oat_data_begin = 0;
     if (!driver->IsImage()) {
+      TimingLogger::ScopedSplit split("Loading image checksum", &timings);
       gc::space::ImageSpace* image_space = Runtime::Current()->GetHeap()->GetImageSpace();
       image_file_location_oat_checksum = image_space->GetImageHeader().GetOatChecksum();
       image_file_location_oat_data_begin =
@@ -284,8 +295,10 @@ class Dex2Oat {
                          image_file_location_oat_checksum,
                          image_file_location_oat_data_begin,
                          image_file_location,
-                         driver.get());
+                         driver.get(),
+                         &timings);
 
+    TimingLogger::ScopedSplit split("Writing ELF", &timings);
     if (!driver->WriteElf(android_root, is_host, dex_files, oat_writer, oat_file)) {
       LOG(ERROR) << "Failed to write ELF file " << oat_file->GetPath();
       return NULL;
@@ -327,9 +340,11 @@ class Dex2Oat {
   explicit Dex2Oat(Runtime* runtime,
                    CompilerBackend compiler_backend,
                    InstructionSet instruction_set,
+                   InstructionSetFeatures instruction_set_features,
                    size_t thread_count)
       : compiler_backend_(compiler_backend),
         instruction_set_(instruction_set),
+        instruction_set_features_(instruction_set_features),
         runtime_(runtime),
         thread_count_(thread_count),
         start_ns_(NanoTime()) {
@@ -342,10 +357,6 @@ class Dex2Oat {
       return false;
     }
     Runtime* runtime = Runtime::Current();
-    // if we loaded an existing image, we will reuse values from the image roots.
-    if (!runtime->HasResolutionMethod()) {
-      runtime->SetResolutionMethod(runtime->CreateResolutionMethod());
-    }
     for (int i = 0; i < Runtime::kLastCalleeSaveType; i++) {
       Runtime::CalleeSaveType type = Runtime::CalleeSaveType(i);
       if (!runtime->HasCalleeSaveMethod(type)) {
@@ -368,9 +379,10 @@ class Dex2Oat {
       if (DexFilesContains(dex_files, parsed[i])) {
         continue;
       }
-      const DexFile* dex_file = DexFile::Open(parsed[i], parsed[i]);
+      std::string error_msg;
+      const DexFile* dex_file = DexFile::Open(parsed[i].c_str(), parsed[i].c_str(), &error_msg);
       if (dex_file == NULL) {
-        LOG(WARNING) << "Failed to open dex file " << parsed[i];
+        LOG(WARNING) << "Failed to open dex file '" << parsed[i] << "': " << error_msg;
       } else {
         dex_files.push_back(dex_file);
       }
@@ -391,6 +403,7 @@ class Dex2Oat {
   const CompilerBackend compiler_backend_;
 
   const InstructionSet instruction_set_;
+  const InstructionSetFeatures instruction_set_features_;
 
   Runtime* runtime_;
   size_t thread_count_;
@@ -416,9 +429,14 @@ static size_t OpenDexFiles(const std::vector<const char*>& dex_filenames,
   for (size_t i = 0; i < dex_filenames.size(); i++) {
     const char* dex_filename = dex_filenames[i];
     const char* dex_location = dex_locations[i];
-    const DexFile* dex_file = DexFile::Open(dex_filename, dex_location);
+    std::string error_msg;
+    if (!OS::FileExists(dex_filename)) {
+      LOG(WARNING) << "Skipping non-existent dex file '" << dex_filename << "'";
+      continue;
+    }
+    const DexFile* dex_file = DexFile::Open(dex_filename, dex_location, &error_msg);
     if (dex_file == NULL) {
-      LOG(WARNING) << "Failed to open .dex from file '" << dex_filename << "'\n";
+      LOG(WARNING) << "Failed to open .dex from file '" << dex_filename << "': " << error_msg;
       ++failure_count;
     } else {
       dex_files.push_back(dex_file);
@@ -558,8 +576,34 @@ class WatchDog {
 const unsigned int WatchDog::kWatchDogWarningSeconds;
 const unsigned int WatchDog::kWatchDogTimeoutSeconds;
 
+// Given a set of instruction features from the build, parse it.  The
+// input 'str' is a comma separated list of feature names.  Parse it and
+// return the InstructionSetFeatures object.
+static InstructionSetFeatures ParseFeatureList(std::string str) {
+  InstructionSetFeatures result;
+  typedef std::vector<std::string> FeatureList;
+  FeatureList features;
+  Split(str, ',', features);
+  for (FeatureList::iterator i = features.begin(); i != features.end(); i++) {
+    std::string feature = Trim(*i);
+    if (feature == "default") {
+      // Nothing to do.
+    } else if (feature == "div") {
+      // Supports divide instruction.
+       result.SetHasDivideInstruction(true);
+    } else if (feature == "nodiv") {
+      // Turn off support for divide instruction.
+      result.SetHasDivideInstruction(false);
+    } else {
+      Usage("Unknown instruction set feature: '%s'", feature.c_str());
+    }
+  }
+  // others...
+  return result;
+}
+
 static int dex2oat(int argc, char** argv) {
-  base::TimingLogger timings("compiler", false, false);
+  TimingLogger timings("compiler", false, false);
 
   InitLogging(argv);
 
@@ -594,6 +638,11 @@ static int dex2oat(int argc, char** argv) {
 #else
   CompilerBackend compiler_backend = kQuick;
 #endif
+
+  // Take the default set of instruction features from the build.
+  InstructionSetFeatures instruction_set_features =
+      ParseFeatureList(STRINGIFY(ART_DEFAULT_INSTRUCTION_SET_FEATURES));
+
 #if defined(__arm__)
   InstructionSet instruction_set = kThumb2;
 #elif defined(__i386__)
@@ -603,8 +652,10 @@ static int dex2oat(int argc, char** argv) {
 #else
 #error "Unsupported architecture"
 #endif
+
+
   bool is_host = false;
-  bool dump_stats = kIsDebugBuild;
+  bool dump_stats = false;
   bool dump_timing = false;
   bool dump_slow_timing = kIsDebugBuild;
   bool watch_dog_enabled = !kIsTargetBuild;
@@ -677,6 +728,9 @@ static int dex2oat(int argc, char** argv) {
       } else if (instruction_set_str == "x86") {
         instruction_set = kX86;
       }
+    } else if (option.starts_with("--instruction-set-features=")) {
+      StringPiece str = option.substr(strlen("--instruction-set-features=")).data();
+      instruction_set_features = ParseFeatureList(str.as_string());
     } else if (option.starts_with("--compiler-backend=")) {
       StringPiece backend_str = option.substr(strlen("--compiler-backend=")).data();
       if (backend_str == "Quick") {
@@ -696,6 +750,8 @@ static int dex2oat(int argc, char** argv) {
       runtime_args.push_back(argv[i]);
     } else if (option == "--dump-timing") {
       dump_timing = true;
+    } else if (option == "--dump-stats") {
+      dump_stats = true;
     } else {
       Usage("Unknown argument %s", option.data());
     }
@@ -867,7 +923,8 @@ static int dex2oat(int argc, char** argv) {
 #endif
 
   Dex2Oat* p_dex2oat;
-  if (!Dex2Oat::Create(&p_dex2oat, options, compiler_backend, instruction_set, thread_count)) {
+  if (!Dex2Oat::Create(&p_dex2oat, options, compiler_backend, instruction_set,
+      instruction_set_features, thread_count)) {
     LOG(ERROR) << "Failed to create dex2oat";
     return EXIT_FAILURE;
   }
@@ -885,14 +942,17 @@ static int dex2oat(int argc, char** argv) {
   // If --image-classes was specified, calculate the full list of classes to include in the image
   UniquePtr<CompilerDriver::DescriptorSet> image_classes(NULL);
   if (image_classes_filename != NULL) {
+    std::string error_msg;
     if (image_classes_zip_filename != NULL) {
       image_classes.reset(dex2oat->ReadImageClassesFromZip(image_classes_zip_filename,
-                                                           image_classes_filename));
+                                                           image_classes_filename,
+                                                           &error_msg));
     } else {
       image_classes.reset(dex2oat->ReadImageClassesFromFile(image_classes_filename));
     }
     if (image_classes.get() == NULL) {
-      LOG(ERROR) << "Failed to create list of image classes from " << image_classes_filename;
+      LOG(ERROR) << "Failed to create list of image classes from '" << image_classes_filename <<
+          "': " << error_msg;
       return EXIT_FAILURE;
     }
   }
@@ -902,14 +962,18 @@ static int dex2oat(int argc, char** argv) {
     dex_files = Runtime::Current()->GetClassLinker()->GetBootClassPath();
   } else {
     if (dex_filenames.empty()) {
-      UniquePtr<ZipArchive> zip_archive(ZipArchive::OpenFromFd(zip_fd));
+      std::string error_msg;
+      UniquePtr<ZipArchive> zip_archive(ZipArchive::OpenFromFd(zip_fd, zip_location.c_str(),
+                                                               &error_msg));
       if (zip_archive.get() == NULL) {
-        LOG(ERROR) << "Failed to open zip from file descriptor for " << zip_location;
+        LOG(ERROR) << "Failed to open zip from file descriptor for '" << zip_location << "': "
+            << error_msg;
         return EXIT_FAILURE;
       }
-      const DexFile* dex_file = DexFile::Open(*zip_archive.get(), zip_location);
+      const DexFile* dex_file = DexFile::Open(*zip_archive.get(), zip_location, &error_msg);
       if (dex_file == NULL) {
-        LOG(ERROR) << "Failed to open dex from file descriptor for zip file: " << zip_location;
+        LOG(ERROR) << "Failed to open dex from file descriptor for zip file '" << zip_location
+            << "': " << error_msg;
         return EXIT_FAILURE;
       }
       dex_files.push_back(dex_file);
@@ -1030,7 +1094,7 @@ static int dex2oat(int argc, char** argv) {
 
   if (is_host) {
     if (dump_timing || (dump_slow_timing && timings.GetTotalNs() > MsToNs(1000))) {
-      LOG(INFO) << Dumpable<base::TimingLogger>(timings);
+      LOG(INFO) << Dumpable<TimingLogger>(timings);
     }
     return EXIT_SUCCESS;
   }
@@ -1061,7 +1125,8 @@ static int dex2oat(int argc, char** argv) {
   // Strip unneeded sections for target
   off_t seek_actual = lseek(oat_file->Fd(), 0, SEEK_SET);
   CHECK_EQ(0, seek_actual);
-  ElfStripper::Strip(oat_file.get());
+  std::string error_msg;
+  CHECK(ElfStripper::Strip(oat_file.get(), &error_msg)) << error_msg;
 
 
   // We wrote the oat file successfully, and want to keep it.
@@ -1071,7 +1136,7 @@ static int dex2oat(int argc, char** argv) {
   timings.EndSplit();
 
   if (dump_timing || (dump_slow_timing && timings.GetTotalNs() > MsToNs(1000))) {
-    LOG(INFO) << Dumpable<base::TimingLogger>(timings);
+    LOG(INFO) << Dumpable<TimingLogger>(timings);
   }
 
   // Everything was successfully written, do an explicit exit here to avoid running Runtime
@@ -1082,8 +1147,6 @@ static int dex2oat(int argc, char** argv) {
 
   return EXIT_SUCCESS;
 }
-
-
 }  // namespace art
 
 int main(int argc, char** argv) {

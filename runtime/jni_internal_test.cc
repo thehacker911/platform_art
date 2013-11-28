@@ -86,19 +86,19 @@ class JniInternalTest : public CommonTest {
     const char* class_name = is_static ? "StaticLeafMethods" : "NonStaticLeafMethods";
     jobject jclass_loader(LoadDex(class_name));
     Thread* self = Thread::Current();
+    SirtRef<mirror::ClassLoader> null_class_loader(self, nullptr);
     SirtRef<mirror::ClassLoader>
         class_loader(self,
                      ScopedObjectAccessUnchecked(self).Decode<mirror::ClassLoader*>(jclass_loader));
     if (is_static) {
-      CompileDirectMethod(class_loader.get(), class_name, method_name, method_signature);
+      CompileDirectMethod(class_loader, class_name, method_name, method_signature);
     } else {
-      CompileVirtualMethod(NULL, "java.lang.Class", "isFinalizable", "()Z");
-      CompileDirectMethod(NULL, "java.lang.Object", "<init>", "()V");
-      CompileVirtualMethod(class_loader.get(), class_name, method_name, method_signature);
+      CompileVirtualMethod(null_class_loader, "java.lang.Class", "isFinalizable", "()Z");
+      CompileDirectMethod(null_class_loader, "java.lang.Object", "<init>", "()V");
+      CompileVirtualMethod(class_loader, class_name, method_name, method_signature);
     }
 
-    mirror::Class* c = class_linker_->FindClass(DotToDescriptor(class_name).c_str(),
-                                                class_loader.get());
+    mirror::Class* c = class_linker_->FindClass(DotToDescriptor(class_name).c_str(), class_loader);
     CHECK(c != NULL);
 
     method = is_static ? c->FindDirectMethod(method_name, method_signature)
@@ -1012,31 +1012,50 @@ TEST_F(JniInternalTest, RegisterNatives) {
                                scalar_type, \
                                expected_class_descriptor) \
   jsize size = 4; \
+  \
   /* Allocate an array and check it has the right type and length. */ \
   scalar_type ## Array a = env_->new_fn(size); \
   EXPECT_TRUE(a != NULL); \
   EXPECT_TRUE(env_->IsInstanceOf(a, env_->FindClass(expected_class_descriptor))); \
   EXPECT_EQ(size, env_->GetArrayLength(a)); \
+  \
+  /* GetPrimitiveArrayRegion/SetPrimitiveArrayRegion */ \
   /* AIOOBE for negative start offset. */ \
   env_->get_region_fn(a, -1, 1, NULL); \
   EXPECT_EXCEPTION(aioobe_); \
   env_->set_region_fn(a, -1, 1, NULL); \
   EXPECT_EXCEPTION(aioobe_); \
+  \
   /* AIOOBE for negative length. */ \
   env_->get_region_fn(a, 0, -1, NULL); \
   EXPECT_EXCEPTION(aioobe_); \
   env_->set_region_fn(a, 0, -1, NULL); \
   EXPECT_EXCEPTION(aioobe_); \
+  \
   /* AIOOBE for buffer overrun. */ \
   env_->get_region_fn(a, size - 1, size, NULL); \
   EXPECT_EXCEPTION(aioobe_); \
   env_->set_region_fn(a, size - 1, size, NULL); \
   EXPECT_EXCEPTION(aioobe_); \
+  \
+  /* It's okay for the buffer to be NULL as long as the length is 0. */ \
+  env_->get_region_fn(a, 2, 0, NULL); \
+  /* Even if the offset is invalid... */ \
+  env_->get_region_fn(a, 123, 0, NULL); \
+  EXPECT_EXCEPTION(aioobe_); \
+  \
+  /* It's okay for the buffer to be NULL as long as the length is 0. */ \
+  env_->set_region_fn(a, 2, 0, NULL); \
+  /* Even if the offset is invalid... */ \
+  env_->set_region_fn(a, 123, 0, NULL); \
+  EXPECT_EXCEPTION(aioobe_); \
+  \
   /* Prepare a couple of buffers. */ \
   UniquePtr<scalar_type[]> src_buf(new scalar_type[size]); \
   UniquePtr<scalar_type[]> dst_buf(new scalar_type[size]); \
   for (jsize i = 0; i < size; ++i) { src_buf[i] = scalar_type(i); } \
   for (jsize i = 0; i < size; ++i) { dst_buf[i] = scalar_type(-1); } \
+  \
   /* Copy all of src_buf onto the heap. */ \
   env_->set_region_fn(a, 0, size, &src_buf[0]); \
   /* Copy back only part. */ \
@@ -1062,7 +1081,6 @@ TEST_F(JniInternalTest, RegisterNatives) {
   EXPECT_EQ(memcmp(&src_buf[0], xs, size * sizeof(scalar_type)), 0) \
     << # get_elements_fn " not equal"; \
   env_->release_elements_fn(a, xs, 0); \
-  EXPECT_EQ(reinterpret_cast<uintptr_t>(v), reinterpret_cast<uintptr_t>(xs))
 
 TEST_F(JniInternalTest, BooleanArrays) {
   EXPECT_PRIMITIVE_ARRAY(NewBooleanArray, GetBooleanArrayRegion, SetBooleanArrayRegion,
@@ -1252,6 +1270,12 @@ TEST_F(JniInternalTest, GetStringRegion_GetStringUTFRegion) {
   EXPECT_EQ('l', chars[2]);
   EXPECT_EQ('x', chars[3]);
 
+  // It's okay for the buffer to be NULL as long as the length is 0.
+  env_->GetStringRegion(s, 2, 0, NULL);
+  // Even if the offset is invalid...
+  env_->GetStringRegion(s, 123, 0, NULL);
+  EXPECT_EXCEPTION(sioobe_);
+
   env_->GetStringUTFRegion(s, -1, 0, NULL);
   EXPECT_EXCEPTION(sioobe_);
   env_->GetStringUTFRegion(s, 0, -1, NULL);
@@ -1267,6 +1291,12 @@ TEST_F(JniInternalTest, GetStringRegion_GetStringUTFRegion) {
   EXPECT_EQ('e', bytes[1]);
   EXPECT_EQ('l', bytes[2]);
   EXPECT_EQ('x', bytes[3]);
+
+  // It's okay for the buffer to be NULL as long as the length is 0.
+  env_->GetStringUTFRegion(s, 2, 0, NULL);
+  // Even if the offset is invalid...
+  env_->GetStringUTFRegion(s, 123, 0, NULL);
+  EXPECT_EXCEPTION(sioobe_);
 }
 
 TEST_F(JniInternalTest, GetStringUTFChars_ReleaseStringUTFChars) {
@@ -1306,7 +1336,7 @@ TEST_F(JniInternalTest, GetStringChars_ReleaseStringChars) {
 
   jboolean is_copy = JNI_FALSE;
   chars = env_->GetStringChars(s, &is_copy);
-  EXPECT_EQ(JNI_FALSE, is_copy);
+  EXPECT_EQ(JNI_TRUE, is_copy);
   EXPECT_EQ(expected[0], chars[0]);
   EXPECT_EQ(expected[1], chars[1]);
   EXPECT_EQ(expected[2], chars[2]);
@@ -1330,7 +1360,8 @@ TEST_F(JniInternalTest, GetStringCritical_ReleaseStringCritical) {
 
   jboolean is_copy = JNI_FALSE;
   chars = env_->GetStringCritical(s, &is_copy);
-  EXPECT_EQ(JNI_FALSE, is_copy);
+  // TODO: Fix GetStringCritical to use the same mechanism as GetPrimitiveArrayElementsCritical.
+  EXPECT_EQ(JNI_TRUE, is_copy);
   EXPECT_EQ(expected[0], chars[0]);
   EXPECT_EQ(expected[1], chars[1]);
   EXPECT_EQ(expected[2], chars[2]);
@@ -1638,9 +1669,9 @@ TEST_F(JniInternalTest, StaticMainMethod) {
   jobject jclass_loader = LoadDex("Main");
   SirtRef<mirror::ClassLoader>
       class_loader(soa.Self(), soa.Decode<mirror::ClassLoader*>(jclass_loader));
-  CompileDirectMethod(class_loader.get(), "Main", "main", "([Ljava/lang/String;)V");
+  CompileDirectMethod(class_loader, "Main", "main", "([Ljava/lang/String;)V");
 
-  mirror::Class* klass = class_linker_->FindClass("LMain;", class_loader.get());
+  mirror::Class* klass = class_linker_->FindClass("LMain;", class_loader);
   ASSERT_TRUE(klass != NULL);
 
   mirror::ArtMethod* method = klass->FindDirectMethod("main", "([Ljava/lang/String;)V");

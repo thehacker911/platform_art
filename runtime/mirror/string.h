@@ -44,6 +44,7 @@ class MANAGED String : public Object {
   }
 
   const CharArray* GetCharArray() const;
+  CharArray* GetCharArray();
 
   int32_t GetOffset() const {
     int32_t result = GetField32(OffsetOffset(), false);
@@ -116,10 +117,8 @@ class MANAGED String : public Object {
 
  private:
   void SetHashCode(int32_t new_hash_code) {
-    DCHECK_EQ(0u,
-              GetField32(OFFSET_OF_OBJECT_MEMBER(String, hash_code_), false));
-    SetField32(OFFSET_OF_OBJECT_MEMBER(String, hash_code_),
-               new_hash_code, false);
+    DCHECK_EQ(0u, GetField32(OFFSET_OF_OBJECT_MEMBER(String, hash_code_), false));
+    SetField32(OFFSET_OF_OBJECT_MEMBER(String, hash_code_), new_hash_code, false);
   }
 
   void SetCount(int32_t new_count) {
@@ -155,8 +154,8 @@ class MANAGED StringClass : public Class {
  private:
   CharArray* ASCII_;
   Object* CASE_INSENSITIVE_ORDER_;
-  int64_t serialVersionUID_;
   uint32_t REPLACEMENT_CHAR_;
+  int64_t serialVersionUID_;
   friend struct art::StringClassOffsets;  // for verifying offset information
   DISALLOW_IMPLICIT_CONSTRUCTORS(StringClass);
 };

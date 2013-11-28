@@ -176,7 +176,7 @@ void ArmMir2Lir::GenConversion(Instruction::Code opcode,
 
 void ArmMir2Lir::GenFusedFPCmpBranch(BasicBlock* bb, MIR* mir, bool gt_bias,
                                      bool is_double) {
-  LIR* target = &block_label_list_[bb->taken->id];
+  LIR* target = &block_label_list_[bb->taken];
   RegLocation rl_src1;
   RegLocation rl_src2;
   if (is_double) {
@@ -274,7 +274,7 @@ void ArmMir2Lir::GenCmpFP(Instruction::Code opcode, RegLocation rl_dest,
   NewLIR0(kThumb2Fmstat);
 
   OpIT((default_result == -1) ? kCondGt : kCondMi, "");
-  NewLIR2(kThumb2MovImmShift, rl_result.low_reg,
+  NewLIR2(kThumb2MovI8M, rl_result.low_reg,
           ModifiedImmediate(-default_result));  // Must not alter ccodes
   GenBarrier();
 

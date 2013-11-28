@@ -39,7 +39,7 @@ class ExceptionTest : public CommonTest {
     ScopedObjectAccess soa(Thread::Current());
     SirtRef<mirror::ClassLoader> class_loader(soa.Self(),
                                       soa.Decode<mirror::ClassLoader*>(LoadDex("ExceptionHandle")));
-    my_klass_ = class_linker_->FindClass("LExceptionHandle;", class_loader.get());
+    my_klass_ = class_linker_->FindClass("LExceptionHandle;", class_loader);
     ASSERT_TRUE(my_klass_ != NULL);
     class_linker_->EnsureInitialized(my_klass_, true, true);
 
@@ -146,7 +146,7 @@ TEST_F(ExceptionTest, StackTraceElement) {
   ScopedObjectAccess soa(env);
 
   std::vector<uintptr_t> fake_stack;
-  ASSERT_EQ(kStackAlignment, 16);
+  ASSERT_EQ(kStackAlignment, 16U);
   ASSERT_EQ(sizeof(uintptr_t), sizeof(uint32_t));
 
 #if !defined(ART_USE_PORTABLE_COMPILER)

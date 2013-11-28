@@ -32,7 +32,7 @@
 #if defined(__APPLE__)
 #define ART_USE_FUTEXES 0
 #else
-#define ART_USE_FUTEXES !defined(__mips__)
+#define ART_USE_FUTEXES 1
 #endif
 
 // Currently Darwin doesn't support locks with timeouts.
@@ -58,7 +58,7 @@ const bool kLogLockContentions = false;
 // futex.
 const bool kLogLockContentions = false;
 #endif
-const size_t kContentionLogSize = 64;
+const size_t kContentionLogSize = 4;
 const size_t kContentionLogDataSize = kLogLockContentions ? 1 : 0;
 const size_t kAllMutexDataSize = kLogLockContentions ? 1 : 0;
 

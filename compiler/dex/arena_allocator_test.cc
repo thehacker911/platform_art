@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011 The Android Open Source Project
+ * Copyright (C) 2013 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,20 @@
  * limitations under the License.
  */
 
-class CreateMethodSignature {
-    Float m1(int a, double b, long c, Object d) { return null; }
-    CreateMethodSignature m2(boolean x, short y, char z) { return null; }
+#include "arena_allocator.h"
+#include "arena_bit_vector.h"
+#include "gtest/gtest.h"
+
+namespace art {
+
+TEST(ArenaAllocator, Test) {
+  ArenaPool pool;
+  ArenaAllocator arena(&pool);
+  ArenaBitVector bv(&arena, 10, true);
+  bv.SetBit(5);
+  EXPECT_EQ(1U, bv.GetStorageSize());
+  bv.SetBit(35);
+  EXPECT_EQ(2U, bv.GetStorageSize());
 }
+
+}  // namespace art
